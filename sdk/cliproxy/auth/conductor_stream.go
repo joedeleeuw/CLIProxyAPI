@@ -8,8 +8,32 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/json"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
+
+func (m *Manager) observeStreamQuota(ctx context.Context, auth *Auth, provider string, opts cliproxyexecutor.Options, ephemeral bool) context.Context {
+	if ephemeral || !ProviderSupportsQuotaObservation(provider) {
+		return ctx
+	}
+	result := Result{AuthID: auth.ID, AccessToken: authAccessTokenForRequest(ctx, auth, opts.Headers), CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch}
+	return internallogging.WithResponseHeadersObserver(ctx, func(headers http.Header, observedAt time.Time) {
+		release := m.lockAuthMutation(result.AuthID)
+		defer release()
+		m.mu.Lock()
+		current := m.auths[result.AuthID]
+		var snapshot *Auth
+		if current != nil && !isStaleExecutionResult(result, current) && current.Quota.ObserveResponseHeadersForProvider(provider, headers, observedAt) {
+			current.Generation++
+			current.UpdatedAt = time.Now()
+			snapshot = current.Clone()
+		}
+		m.mu.Unlock()
+		if snapshot != nil && m.scheduler != nil {
+			m.scheduler.upsertAuthResult(snapshot, nil, true)
+		}
+	})
+}
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
 	if ch == nil {
@@ -442,6 +466,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 		executionSeq := m.nextExecutionSeq()
 		startStream := time.Now()
+		ctx = m.observeStreamQuota(ctx, auth, provider, execOpts, ephemeralResult)
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 		if hasUpstreamExecutionAttempt(errStream) {
@@ -464,6 +489,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
+					ctx = m.observeStreamQuota(ctx, auth, provider, execOpts, ephemeralResult)
 					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 					if hasUpstreamExecutionAttempt(errStream) {
@@ -545,6 +571,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					ctx = m.newUpstreamAttemptContext(ctx)
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
+					ctx = m.observeStreamQuota(ctx, auth, provider, execOpts, ephemeralResult)
 					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					retryErr = markUpstreamExecutionAttemptFromContext(ctx, retryErr)
 					retryStream, retryErr = validateStreamResult(retryStream, retryErr)
